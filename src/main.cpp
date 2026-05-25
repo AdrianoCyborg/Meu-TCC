@@ -6,9 +6,9 @@
 //////////////////////
 // CONFIG WIFI E MQTT
 //////////////////////
-const char* ssid = "NOME_DA_TUA_REDE";
-const char* password = "SENHA_DA_REDE";
-const char* mqtt_server = "192.168.15.5"; 
+const char* ssid = "Joao Arthur 5G";
+const char* password = "190421pl";
+const char* mqtt_server = "192.168.0.108"; 
 
 WiFiClient espClient;
 PubSubClient client(espClient);
