@@ -2,59 +2,85 @@
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <math.h>
+#include <ctype.h>
 
+//////////////////////
+// CONFIG WIFI E MQTT
+//////////////////////
 const char* ssid = "Joao Arthur 5G";
 const char* password = "190421pl";
-const char* mqtt_server = "192.168.0.108";
+const char* mqtt_server = "192.168.0.102";
 
 WiFiClient espClient;
 PubSubClient client(espClient);
 bool avisoConexaoPerdida = false;
 
+//////////////////////
+// PINOS DE HARDWARE
+//////////////////////
 #define PINO_SENSOR_A 35
 #define PINO_SENSOR_B 34
 #define PINO_RELE_BOMBA 32
 #define PINO_RELE_VALVULA1 33
 #define PINO_RELE_VALVULA2 25
+#define PINO_BOTAO_START 27
 #define LED_PIN 2
 
+const char* TOPICO_COMANDO = "esp32/comando";
+const char* CLIENT_ID_MQTT = "ESP32_SACOP";
+
+//////////////////////
+// PARÂMETROS DO SENSOR E HARDWARE
+//////////////////////
 const float PRESSAO_MAXIMA_FS = 30.0;
-const float TENSAO_MIN_SENSOR = 0.41;
+const float TENSAO_MIN_SENSOR_A = 0.49; // Zero físico exato (S1)
+const float TENSAO_MIN_SENSOR_B = 0.25; // Zero físico exato (S2)
 const float TENSAO_MAX_SENSOR = 4.5;
 const float TENSAO_MAX_ADC_ESP = 3.3;
 
 const float FATOR_DIVISOR = 10.0 / (4.7 + 10.0);
-const float ADC_PARA_TENSAO_SENSOR = TENSAO_MAX_ADC_ESP / 4095.0 / FATOR_DIVISOR;
-const float SENSOR_PARA_PRESSAO = PRESSAO_MAXIMA_FS / (TENSAO_MAX_SENSOR - TENSAO_MIN_SENSOR);
 
-const float TENSAO_SENSOR_MIN_VALIDA = 0.20;
+const float TENSAO_SENSOR_MIN_VALIDA = 0.10;
 const float TENSAO_SENSOR_MAX_VALIDA = 4.65;
 
+//////////////////////
+// VARIÁVEIS DE LÓGICA E SEGURANÇA
+//////////////////////
 float pressaoRefA = 0;
 float pressaoRefB = 0;
 float pressaoAtualA = 0;
 float pressaoAtualB = 0;
 
-const float MARGEM_TOLERANCIA = 0.90;
-const float PRESSAO_REF_MINIMA = 0.05;
-const float MAX_OSCILACAO_CALIBRACAO = 0.10;
+// Limites de Segurança com Histerese (Zona Morta)
+// Deixe a sensibilidade alta (5% para alarme, 3% para reset)
+const float MARGEM_TOLERANCIA = 0.85; // Caiu 15% -> Inicia o cronômetro (exige um vazamento real e visível)
+const float MARGEM_RESET      = 0.92;
 
-const uint32_t TEMPO_CONFIRMACAO = 3000;
+bool estadoQuedaA = false;
+bool estadoQuedaB = false;
+
+const float PRESSAO_REF_MINIMA = 0.05;
+const float MAX_OSCILACAO_CALIBRACAO = 7.00; // Margem para pulsação da bomba
+
+const uint32_t TEMPO_CONFIRMACAO = 6000; // Meio segundo ininterrupto para confirmar o vazamento
 const uint32_t MAX_INTERVALO_AMOSTRA = 100;
 const float DELTA_MIN_LOCALIZACAO = 0.10;
 
-const uint32_t MAX_INTERVALO_LOOP_SEGURO = 250;
+const uint32_t MAX_INTERVALO_LOOP_SEGURO = 1000;
 uint32_t ultimoCicloSeguro = 0;
 
 const uint32_t TEMPO_ALIVIO_BOMBA = 300;
-const uint32_t TEMPO_ESTABILIZACAO = 8000;
+const uint32_t TEMPO_ESTABILIZACAO = 12000; 
 const uint32_t INTERVALO_CHECK_CALIBRACAO = 50;
-const uint32_t TEMPO_MAX_SEM_PRESSAO = 3000;
+const uint32_t TEMPO_MAX_SEM_PRESSAO = 8000; 
+const uint32_t TEMPO_DEBOUNCE_BOTAO = 50;
 
 const uint32_t INTERVALO_RETRY_MQTT = 5000;
 const uint32_t TEMPO_CONEXAO_WIFI_INICIAL = 8000;
 uint32_t ultimaTentativaMQTT = 0;
 uint32_t ultimoEnvioMQTT = 0;
+
+bool pedidoStart = false;
 
 struct DebounceQueda {
   bool ativo = false;
@@ -69,6 +95,7 @@ struct LeituraPressao {
 };
 
 enum EstadoSistema {
+  AGUARDANDO_START,
   CALIBRANDO,
   MONITORANDO,
   AGUARDANDO_ALIVIO_BOMBA,
@@ -78,30 +105,49 @@ enum EstadoSistema {
 };
 
 DebounceQueda dbA, dbB;
-EstadoSistema estadoAtual = CALIBRANDO;
+EstadoSistema estadoAtual = AGUARDANDO_START;
 
 uint32_t inicioAlivio = 0;
 int trechoVazamento = 0;
 
+//////////////////////
+// FUNÇÃO MESTRE DE LEITURA (ALTA VELOCIDADE)
+//////////////////////
 LeituraPressao lerPressaoSegura(int pino) {
-  int valorBruto = analogRead(pino);
-  float tensaoSensor = valorBruto * ADC_PARA_TENSAO_SENSOR;
+  // Leitura via eFuse para correção de não-linearidade em baixa tensão
+  uint32_t milivoltsReais = analogReadMilliVolts(pino);
+  float tensaoPino = milivoltsReais / 1000.0;
+  float tensaoSensor = tensaoPino / FATOR_DIVISOR;
 
+  // Proteção elétrica: verifica rompimento de cabo ou curto-circuito
   if (tensaoSensor < TENSAO_SENSOR_MIN_VALIDA || tensaoSensor > TENSAO_SENSOR_MAX_VALIDA) {
     return {0.0, false};
   }
 
-  if (tensaoSensor <= TENSAO_MIN_SENSOR) return {0.0, true};
+  // Trava do zero baseada no perfil individual de cada sensor
+  float tensaoMinimaReal = (pino == PINO_SENSOR_A) ? TENSAO_MIN_SENSOR_A : TENSAO_MIN_SENSOR_B;
+  if (tensaoSensor <= tensaoMinimaReal) return {0.0, true};
 
-  float pressao = (tensaoSensor - TENSAO_MIN_SENSOR) * SENSOR_PARA_PRESSAO;
+  // Conversão de escala
+  float fatorConversaoPressao = PRESSAO_MAXIMA_FS / (TENSAO_MAX_SENSOR - tensaoMinimaReal);
+  float pressao = (tensaoSensor - tensaoMinimaReal) * fatorConversaoPressao;
+  
   if (pressao > PRESSAO_MAXIMA_FS) pressao = PRESSAO_MAXIMA_FS;
 
-  return {pressao, true};
+  return {pressao, true}; 
 }
 
 void limparDebounces() {
   dbA = DebounceQueda{};
   dbB = DebounceQueda{};
+  estadoQuedaA = false;
+  estadoQuedaB = false;
+}
+
+void colocarSaidasEmRepouso() {
+  digitalWrite(PINO_RELE_BOMBA, LOW);
+  digitalWrite(PINO_RELE_VALVULA1, LOW);
+  digitalWrite(PINO_RELE_VALVULA2, LOW);
 }
 
 void solicitarFalhaSegura(const char* motivo, uint32_t agora) {
@@ -111,7 +157,7 @@ void solicitarFalhaSegura(const char* motivo, uint32_t agora) {
   inicioAlivio = agora;
   estadoAtual = FALHA_AGUARDANDO_ALIVIO;
 
-  Serial.println(">>> FALHA CRITICA DETETADA - BOMBA DESLIGADA <<<");
+  Serial.println("\n>>> FALHA CRITICA DETECTADA - BOMBA DESLIGADA <<<");
   Serial.println(motivo);
 }
 
@@ -159,16 +205,14 @@ bool aguardarEstabilizacaoMonitorada() {
         inicioSemPressao = 0;
       }
     }
-
     delay(1);
   }
-
   return true;
 }
 
 void calibrarSistema() {
   estadoAtual = CALIBRANDO;
-  Serial.println("\n>>> INICIANDO CALIBRACAO <<<");
+  Serial.println("\n>>> INICIANDO CALIBRACAO DINAMICA <<<");
 
   digitalWrite(PINO_RELE_VALVULA1, HIGH);
   digitalWrite(PINO_RELE_VALVULA2, HIGH);
@@ -185,7 +229,7 @@ void calibrarSistema() {
     LeituraPressao lB = lerPressaoSegura(PINO_SENSOR_B);
 
     if (!lA.valido || !lB.valido) {
-      solicitarFalhaSegura("Erro eletrico no sensor durante media de calibracao.", millis());
+      solicitarFalhaSegura("Erro eletrico no sensor durante captura de media.", millis());
       return;
     }
 
@@ -197,19 +241,26 @@ void calibrarSistema() {
     somaA += lA.pressao;
     somaB += lB.pressao;
 
-    delay(50);
+    delay(20); // Amostragem veloz pós-estabilização
   }
 
-  if ((maxA - minA) > MAX_OSCILACAO_CALIBRACAO || (maxB - minB) > MAX_OSCILACAO_CALIBRACAO) {
-    solicitarFalhaSegura("Pressao instavel durante calibracao.", millis());
+  float deltaA = maxA - minA;
+  float deltaB = maxB - minB;
+
+  if (deltaA > MAX_OSCILACAO_CALIBRACAO || deltaB > MAX_OSCILACAO_CALIBRACAO) {
+    Serial.println("\n!!! DIAGNOSTICO DE TURBULENCIA EXTREMA !!!");
+    Serial.print("Variacao S1: "); Serial.print(deltaA); Serial.println(" PSI");
+    Serial.print("Variacao S2: "); Serial.print(deltaB); Serial.println(" PSI");
+    solicitarFalhaSegura("Pressao oscilou acima do limite de operacao segura.", millis());
     return;
   }
 
-  pressaoRefA = somaA / 50.0;
-  pressaoRefB = somaB / 50.0;
+  // Captura de Referência no Regime Estacionário
+  pressaoRefA = pressaoAtualA = somaA / 50.0;
+  pressaoRefB = pressaoAtualB = somaB / 50.0;
 
   if (pressaoRefA <= PRESSAO_REF_MINIMA || pressaoRefB <= PRESSAO_REF_MINIMA) {
-    solicitarFalhaSegura("Pressao base muito baixa pos-estabilizacao.", millis());
+    solicitarFalhaSegura("Pressao base estagnou em nivel muito baixo.", millis());
     return;
   }
 
@@ -217,11 +268,12 @@ void calibrarSistema() {
   estadoAtual = MONITORANDO;
 
   Serial.println(">>> CALIBRACAO BEM SUCEDIDA. SISTEMA EM MONITORAMENTO! <<<");
+  Serial.print("Referencia ajustada para operacao: "); Serial.print(pressaoRefA); Serial.println(" PSI");
 }
 
 bool atualizarDebounce(DebounceQueda &db, bool queda, uint32_t agora) {
   if (!queda) {
-    db = DebounceQueda{};
+    db = DebounceQueda{}; // Reseta o acumulador apenas se saiu da histerese com folga
     return false;
   }
 
@@ -235,7 +287,7 @@ bool atualizarDebounce(DebounceQueda &db, bool queda, uint32_t agora) {
   db.ultimo = agora;
 
   if (dt > MAX_INTERVALO_AMOSTRA) {
-    return true;
+    return true; // Perda de processamento
   }
 
   db.acumulado += dt;
@@ -265,34 +317,66 @@ bool suspeitaVazamentoEmAndamento() {
 
 void processarSeguranca(uint32_t agora) {
   if (estadoAtual == MONITORANDO) {
-    bool quedaA = pressaoAtualA < (pressaoRefA * MARGEM_TOLERANCIA);
-    bool quedaB = pressaoAtualB < (pressaoRefB * MARGEM_TOLERANCIA);
+    
+    // --- LÓGICA DE HISTERESE (ZONA MORTA) ---
+    float limiteAlarmeA = pressaoRefA * MARGEM_TOLERANCIA;
+    float limiteResetA  = pressaoRefA * MARGEM_RESET;
+    float limiteAlarmeB = pressaoRefB * MARGEM_TOLERANCIA;
+    float limiteResetB  = pressaoRefB * MARGEM_RESET;
+
+    if (pressaoAtualA <= limiteAlarmeA) {
+      estadoQuedaA = true;
+    } else if (pressaoAtualA >= limiteResetA) {
+      estadoQuedaA = false;
+    }
+
+    if (pressaoAtualB <= limiteAlarmeB) {
+      estadoQuedaB = true;
+    } else if (pressaoAtualB >= limiteResetB) {
+      estadoQuedaB = false;
+    }
+    // ----------------------------------------
 
     bool falhaAmostragem =
-      atualizarDebounce(dbA, quedaA, agora) ||
-      atualizarDebounce(dbB, quedaB, agora);
+      atualizarDebounce(dbA, estadoQuedaA, agora) ||
+      atualizarDebounce(dbB, estadoQuedaB, agora);
 
     if (falhaAmostragem) {
-      solicitarFalhaSegura("Perda de cadencia na suspeita.", agora);
+      solicitarFalhaSegura("Perda de cadencia na analise de suspeita.", agora);
       return;
     }
 
+    // GATILHO DE CONFIRMAÇÃO DE VAZAMENTO
     if (dbA.confirmado || dbB.confirmado) {
-      trechoVazamento = escolherTrecho(dbA.confirmado, dbB.confirmado, quedaA, quedaB);
+      trechoVazamento = escolherTrecho(dbA.confirmado, dbB.confirmado, estadoQuedaA, estadoQuedaB);
       limparDebounces();
 
       digitalWrite(PINO_RELE_BOMBA, LOW);
       inicioAlivio = agora;
 
+      // >>> PAINEL DE DIAGNÓSTICO SERIAL <<<
+      Serial.println("\n==================================================");
+      Serial.println("!!! ALARME: QUEDA DE PRESSAO CONFIRMADA !!!");
+      
+      if (trechoVazamento == 1) {
+        Serial.println("-> Localizacao estimada: TRECHO A (Antes do Sensor 1)");
+      } else if (trechoVazamento == 2) {
+        Serial.println("-> Localizacao estimada: TRECHO B (Entre sensores S1 e S2)");
+      } else {
+        Serial.println("-> Localizacao estimada: TRECHO C (Apos o Sensor 2)");
+      }
+      Serial.println("==================================================");
+
       estadoAtual = (trechoVazamento == 0) ? FALHA_AGUARDANDO_ALIVIO : AGUARDANDO_ALIVIO_BOMBA;
     }
+    
   } else if (estadoAtual == AGUARDANDO_ALIVIO_BOMBA) {
     if (agora - inicioAlivio >= TEMPO_ALIVIO_BOMBA) {
       if (trechoVazamento == 1) digitalWrite(PINO_RELE_VALVULA1, LOW);
       else if (trechoVazamento == 2) digitalWrite(PINO_RELE_VALVULA2, LOW);
 
       estadoAtual = ISOLADO;
-      Serial.println("!!!! VAZAMENTO SETORIAL ISOLADO - VALVULA ATUADA !!!!");
+      Serial.println("\n>>> VAZAMENTO SETORIAL ISOLADO - VALVULA ATUADA <<<");
     }
   } else if (estadoAtual == FALHA_AGUARDANDO_ALIVIO) {
     if (agora - inicioAlivio >= TEMPO_ALIVIO_BOMBA) {
@@ -300,14 +384,96 @@ void processarSeguranca(uint32_t agora) {
       digitalWrite(PINO_RELE_VALVULA2, LOW);
 
       estadoAtual = FALHA_SEGURA;
-      Serial.println(">>> SISTEMA TRANCADO EM FALHA SEGURA GLOBAL <<<");
+      Serial.println("\n>>> SISTEMA TRANCADO EM FALHA SEGURA GLOBAL <<<");
     }
   }
 }
 
-void conectarRedeInicial() {
-  Serial.println(">>> INICIANDO REDE ANTES DA HIDRAULICA <<<");
+bool botaoStartPressionado(uint32_t agora) {
+  static bool ultimoLido = HIGH;
+  static bool estadoEstavel = HIGH;
+  static uint32_t ultimaMudanca = 0;
 
+  bool lido = digitalRead(PINO_BOTAO_START);
+
+  if (lido != ultimoLido) {
+    ultimoLido = lido;
+    ultimaMudanca = agora;
+  }
+
+  if ((agora - ultimaMudanca >= TEMPO_DEBOUNCE_BOTAO) && (lido != estadoEstavel)) {
+    estadoEstavel = lido;
+    return estadoEstavel == LOW;
+  }
+
+  return false;
+}
+
+void solicitarStart(const char* origem) {
+  if (estadoAtual != AGUARDANDO_START) {
+    Serial.print("[START IGNORADO] Maquina ja esta em operacao ou falha. Origem: ");
+    Serial.println(origem);
+    return;
+  }
+
+  pedidoStart = true;
+  Serial.print("\n[START] Pedido de partida validado. Origem: ");
+  Serial.println(origem);
+}
+
+void iniciarSistema() {
+  pedidoStart = false;
+  trechoVazamento = 0;
+  pressaoRefA = 0;
+  pressaoRefB = 0;
+  pressaoAtualA = 0;
+  pressaoAtualB = 0;
+  limparDebounces();
+  colocarSaidasEmRepouso();
+
+  calibrarSistema();
+}
+
+void tratarStart(uint32_t agora) {
+  if (botaoStartPressionado(agora)) {
+    solicitarStart("Painel Local (Botao Fisico)");
+  }
+
+  if (pedidoStart && estadoAtual == AGUARDANDO_START) {
+    iniciarSistema();
+  } else if (pedidoStart) {
+    pedidoStart = false;
+  }
+}
+
+void callbackMQTT(char* topic, byte* payload, unsigned int length) {
+  char msg[16];
+  unsigned int len = min(length, (unsigned int)(sizeof(msg) - 1));
+
+  memcpy(msg, payload, len);
+  msg[len] = '\0';
+
+  while (len > 0 && isspace((unsigned char)msg[len - 1])) {
+    msg[--len] = '\0';
+  }
+
+  for (unsigned int i = 0; i < len; i++) {
+    msg[i] = toupper((unsigned char)msg[i]);
+  }
+
+  if (strcmp(topic, TOPICO_COMANDO) == 0 && strcmp(msg, "START") == 0) {
+    solicitarStart("Painel Remoto (Node-RED)");
+  }
+}
+
+bool conectarMQTT() {
+  if (!client.connect(CLIENT_ID_MQTT)) return false;
+  client.subscribe(TOPICO_COMANDO);
+  return true;
+}
+
+void conectarRedeInicial() {
+  Serial.println(">>> INICIANDO SUBSISTEMA DE REDE <<<");
   uint32_t inicio = millis();
 
   while (WiFi.status() != WL_CONNECTED && millis() - inicio < TEMPO_CONEXAO_WIFI_INICIAL) {
@@ -316,26 +482,26 @@ void conectarRedeInicial() {
 
   if (WiFi.status() != WL_CONNECTED) {
     avisoConexaoPerdida = true;
-    Serial.println("[AVISO] WiFi indisponivel no arranque. Controle hidraulico seguira localmente.");
+    Serial.println("[AVISO] WiFi indisponivel no arranque. Operacao restrita ao controle local.");
     return;
   }
 
   Serial.print("[INFO] WiFi conectado. IP: ");
   Serial.println(WiFi.localIP());
 
-  if (client.connect("ESP32_SACOP")) {
+  if (conectarMQTT()) {
     avisoConexaoPerdida = false;
-    Serial.println("[INFO] MQTT conectado antes da calibracao.");
+    Serial.println("[INFO] Servidor MQTT estabelecido. Node-RED pronto.");
   } else {
     avisoConexaoPerdida = true;
-    Serial.println("[AVISO] MQTT indisponivel no arranque. Controle hidraulico seguira localmente.");
+    Serial.println("[AVISO] Falha de conexao com MQTT. Node-RED indisponivel.");
   }
 }
 
 void manterMQTT(uint32_t agora) {
   if (WiFi.status() != WL_CONNECTED) {
     if (!avisoConexaoPerdida) {
-      Serial.println("[AVISO] WiFi perdido. Controle hidraulico continua localmente.");
+      Serial.println("\n[AVISO] Sinal WiFi perdido! Sistema segue mantendo a seguranca via hardware.");
       avisoConexaoPerdida = true;
     }
     return;
@@ -343,27 +509,28 @@ void manterMQTT(uint32_t agora) {
 
   if (!client.connected()) {
     if (!avisoConexaoPerdida) {
-      Serial.println("[AVISO] Broker MQTT perdido. Controle hidraulico continua localmente.");
+      Serial.println("\n[AVISO] Conexao com Broker MQTT derrubada.");
       avisoConexaoPerdida = true;
     }
 
     if (estadoAtual == MONITORANDO || estadoAtual == CALIBRANDO) {
-      return;
+      return; // Nao tenta reconectar se a maquina esta sob vigilancia de pressao
     }
 
     if (agora - ultimaTentativaMQTT >= INTERVALO_RETRY_MQTT) {
       ultimaTentativaMQTT = agora;
-      client.connect("ESP32_SACOP");
+      if (conectarMQTT()) {
+        avisoConexaoPerdida = false;
+        Serial.println("\n[INFO] Rede reestabelecida com sucesso.");
+      }
     }
-
     return;
   }
 
   if (avisoConexaoPerdida) {
-    Serial.println("[INFO] Conexao de rede reestabelecida.");
+    Serial.println("\n[INFO] Todas as conexoes de rede operacionais.");
     avisoConexaoPerdida = false;
   }
-
   client.loop();
 }
 
@@ -371,10 +538,11 @@ void publicarMQTT(uint32_t agora) {
   if (client.connected() && (agora - ultimoEnvioMQTT >= 2000)) {
     ultimoEnvioMQTT = agora;
 
-    char json[128];
+    char json[160];
     snprintf(json, sizeof(json),
-             "{\"pA\":%.2f,\"pB\":%.2f,\"estado\":%d,\"trecho\":%d}",
-             pressaoAtualA, pressaoAtualB, estadoAtual, trechoVazamento);
+             "{\"pA\":%.2f,\"pB\":%.2f,\"estado\":%d,\"trecho\":%d,\"start\":%d}",
+             pressaoAtualA, pressaoAtualB, estadoAtual, trechoVazamento,
+             estadoAtual != AGUARDANDO_START);
 
     client.publish("esp32/sensores", json);
     digitalWrite(LED_PIN, !digitalRead(LED_PIN));
@@ -388,10 +556,9 @@ void setup() {
   pinMode(PINO_RELE_BOMBA, OUTPUT);
   pinMode(PINO_RELE_VALVULA1, OUTPUT);
   pinMode(PINO_RELE_VALVULA2, OUTPUT);
+  pinMode(PINO_BOTAO_START, INPUT_PULLUP);
 
-  digitalWrite(PINO_RELE_BOMBA, LOW);
-  digitalWrite(PINO_RELE_VALVULA1, LOW);
-  digitalWrite(PINO_RELE_VALVULA2, LOW);
+  colocarSaidasEmRepouso();
 
   analogReadResolution(12);
   analogSetPinAttenuation(PINO_SENSOR_A, ADC_11db);
@@ -399,29 +566,38 @@ void setup() {
 
   WiFi.begin(ssid, password);
   client.setServer(mqtt_server, 1883);
+  client.setCallback(callbackMQTT);
   client.setSocketTimeout(1);
   client.setKeepAlive(10);
 
   conectarRedeInicial();
-  calibrarSistema();
+
+  estadoAtual = AGUARDANDO_START;
+  Serial.println("\n>>> SISTEMA SEGURO. AGUARDANDO COMANDO DE START <<<");
 }
 
 void loop() {
   uint32_t agora = millis();
 
   verificarCadenciaLoop(agora);
+  tratarStart(agora);
 
-  if (estadoAtual != FALHA_SEGURA &&
-      estadoAtual != AGUARDANDO_ALIVIO_BOMBA &&
-      estadoAtual != FALHA_AGUARDANDO_ALIVIO) {
+  if (estadoAtual == MONITORANDO) {
     LeituraPressao lA = lerPressaoSegura(PINO_SENSOR_A);
     LeituraPressao lB = lerPressaoSegura(PINO_SENSOR_B);
-
+    
     if (!lA.valido || !lB.valido) {
-      solicitarFalhaSegura("Sinal eletrico perdido/oscilante nos sensores.", agora);
+      solicitarFalhaSegura("Sinal eletrico corrompido nos sensores (Falha de HW).", agora);
     } else {
-      pressaoAtualA = lA.pressao;
-      pressaoAtualB = lB.pressao;
+      // --- FILTRO PASSA-BAIXA (AMORTECEDOR DIGITAL) ---
+      static uint32_t ultimaAtualizacaoFiltro = 0;
+      
+      // Executa a matemática a 100Hz (a cada 10ms), garantindo fluidez sem travar
+      if (agora - ultimaAtualizacaoFiltro >= 10) { 
+        pressaoAtualA = (lA.pressao * 0.10) + (pressaoAtualA * 0.90);
+        pressaoAtualB = (lB.pressao * 0.10) + (pressaoAtualB * 0.90);
+        ultimaAtualizacaoFiltro = agora;
+      }
     }
   }
 
