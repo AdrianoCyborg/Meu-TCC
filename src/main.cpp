@@ -52,9 +52,8 @@ float pressaoAtualA = 0;
 float pressaoAtualB = 0;
 
 // Limites de Segurança com Histerese (Zona Morta)
-// Deixe a sensibilidade alta (5% para alarme, 3% para reset)
-const float MARGEM_TOLERANCIA = 0.85; // Caiu 15% -> Inicia o cronômetro (exige um vazamento real e visível)
-const float MARGEM_RESET      = 0.92;
+const float MARGEM_TOLERANCIA = 0.85; // Caiu 15% -> Inicia o cronômetro
+const float MARGEM_RESET      = 0.92; // Subiu para 92% -> Aborta o alarme
 
 bool estadoQuedaA = false;
 bool estadoQuedaB = false;
@@ -62,7 +61,7 @@ bool estadoQuedaB = false;
 const float PRESSAO_REF_MINIMA = 0.05;
 const float MAX_OSCILACAO_CALIBRACAO = 7.00; // Margem para pulsação da bomba
 
-const uint32_t TEMPO_CONFIRMACAO = 6000; // Meio segundo ininterrupto para confirmar o vazamento
+const uint32_t TEMPO_CONFIRMACAO = 6000; // 6 segundos ininterruptos para confirmar o vazamento
 const uint32_t MAX_INTERVALO_AMOSTRA = 100;
 const float DELTA_MIN_LOCALIZACAO = 0.10;
 
@@ -114,21 +113,17 @@ int trechoVazamento = 0;
 // FUNÇÃO MESTRE DE LEITURA (ALTA VELOCIDADE)
 //////////////////////
 LeituraPressao lerPressaoSegura(int pino) {
-  // Leitura via eFuse para correção de não-linearidade em baixa tensão
   uint32_t milivoltsReais = analogReadMilliVolts(pino);
   float tensaoPino = milivoltsReais / 1000.0;
   float tensaoSensor = tensaoPino / FATOR_DIVISOR;
 
-  // Proteção elétrica: verifica rompimento de cabo ou curto-circuito
   if (tensaoSensor < TENSAO_SENSOR_MIN_VALIDA || tensaoSensor > TENSAO_SENSOR_MAX_VALIDA) {
     return {0.0, false};
   }
 
-  // Trava do zero baseada no perfil individual de cada sensor
   float tensaoMinimaReal = (pino == PINO_SENSOR_A) ? TENSAO_MIN_SENSOR_A : TENSAO_MIN_SENSOR_B;
   if (tensaoSensor <= tensaoMinimaReal) return {0.0, true};
 
-  // Conversão de escala
   float fatorConversaoPressao = PRESSAO_MAXIMA_FS / (TENSAO_MAX_SENSOR - tensaoMinimaReal);
   float pressao = (tensaoSensor - tensaoMinimaReal) * fatorConversaoPressao;
   
@@ -241,7 +236,7 @@ void calibrarSistema() {
     somaA += lA.pressao;
     somaB += lB.pressao;
 
-    delay(20); // Amostragem veloz pós-estabilização
+    delay(20); 
   }
 
   float deltaA = maxA - minA;
@@ -255,7 +250,6 @@ void calibrarSistema() {
     return;
   }
 
-  // Captura de Referência no Regime Estacionário
   pressaoRefA = pressaoAtualA = somaA / 50.0;
   pressaoRefB = pressaoAtualB = somaB / 50.0;
 
@@ -273,7 +267,7 @@ void calibrarSistema() {
 
 bool atualizarDebounce(DebounceQueda &db, bool queda, uint32_t agora) {
   if (!queda) {
-    db = DebounceQueda{}; // Reseta o acumulador apenas se saiu da histerese com folga
+    db = DebounceQueda{}; 
     return false;
   }
 
@@ -287,7 +281,7 @@ bool atualizarDebounce(DebounceQueda &db, bool queda, uint32_t agora) {
   db.ultimo = agora;
 
   if (dt > MAX_INTERVALO_AMOSTRA) {
-    return true; // Perda de processamento
+    return true; 
   }
 
   db.acumulado += dt;
@@ -335,7 +329,6 @@ void processarSeguranca(uint32_t agora) {
     } else if (pressaoAtualB >= limiteResetB) {
       estadoQuedaB = false;
     }
-    // ----------------------------------------
 
     bool falhaAmostragem =
       atualizarDebounce(dbA, estadoQuedaA, agora) ||
@@ -354,7 +347,6 @@ void processarSeguranca(uint32_t agora) {
       digitalWrite(PINO_RELE_BOMBA, LOW);
       inicioAlivio = agora;
 
-      // >>> PAINEL DE DIAGNÓSTICO SERIAL <<<
       Serial.println("\n==================================================");
       Serial.println("!!! ALARME: QUEDA DE PRESSAO CONFIRMADA !!!");
       
@@ -409,6 +401,23 @@ bool botaoStartPressionado(uint32_t agora) {
   return false;
 }
 
+void resetarSistema(const char* origem) {
+  Serial.print("\n[RESET] Comando de destravamento recebido por: ");
+  Serial.println(origem);
+
+  colocarSaidasEmRepouso();
+  limparDebounces();
+  pedidoStart = false;
+  trechoVazamento = 0;
+  pressaoRefA = 0;
+  pressaoRefB = 0;
+  pressaoAtualA = 0;
+  pressaoAtualB = 0;
+
+  estadoAtual = AGUARDANDO_START;
+  Serial.println(">>> SISTEMA RESETADO. AGUARDANDO NOVO START <<<");
+}
+
 void solicitarStart(const char* origem) {
   if (estadoAtual != AGUARDANDO_START) {
     Serial.print("[START IGNORADO] Maquina ja esta em operacao ou falha. Origem: ");
@@ -436,7 +445,13 @@ void iniciarSistema() {
 
 void tratarStart(uint32_t agora) {
   if (botaoStartPressionado(agora)) {
-    solicitarStart("Painel Local (Botao Fisico)");
+    // Se a máquina estiver travada, o botão atua como RESET
+    if (estadoAtual == FALHA_SEGURA || estadoAtual == ISOLADO || estadoAtual == FALHA_AGUARDANDO_ALIVIO) {
+      resetarSistema("Painel Local (Botao Fisico)");
+    } else {
+      // Caso contrário, atua como START
+      solicitarStart("Painel Local (Botao Fisico)");
+    }
   }
 
   if (pedidoStart && estadoAtual == AGUARDANDO_START) {
@@ -461,8 +476,18 @@ void callbackMQTT(char* topic, byte* payload, unsigned int length) {
     msg[i] = toupper((unsigned char)msg[i]);
   }
 
-  if (strcmp(topic, TOPICO_COMANDO) == 0 && strcmp(msg, "START") == 0) {
-    solicitarStart("Painel Remoto (Node-RED)");
+  // Verifica se o tópico corresponde ao tópico de comando esperado
+  if (strcmp(topic, TOPICO_COMANDO) == 0) {
+    if (strcmp(msg, "START") == 0) {
+      solicitarStart("Painel Remoto (Node-RED)");
+    } else if (strcmp(msg, "RESET") == 0) {
+      // Verifica se o sistema realmente precisa de reset antes de atuar
+      if (estadoAtual == FALHA_SEGURA || estadoAtual == ISOLADO || estadoAtual == FALHA_AGUARDANDO_ALIVIO) {
+        resetarSistema("Painel Remoto (Node-RED)");
+      } else {
+        Serial.println("\n[RESET IGNORADO] O sistema nao esta em estado de falha.");
+      }
+    }
   }
 }
 
@@ -514,7 +539,7 @@ void manterMQTT(uint32_t agora) {
     }
 
     if (estadoAtual == MONITORANDO || estadoAtual == CALIBRANDO) {
-      return; // Nao tenta reconectar se a maquina esta sob vigilancia de pressao
+      return; 
     }
 
     if (agora - ultimaTentativaMQTT >= INTERVALO_RETRY_MQTT) {
